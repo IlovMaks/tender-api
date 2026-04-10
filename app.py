@@ -162,20 +162,39 @@ def fill_xlsx(file_bytes, coord_map):
     wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
     ws = wb.active
 
+    # Build set of merged cell top-left corners — these are writable
+    # Merged cells: only the top-left cell is writable, others are MergedCell (read-only)
+    merged_top_left = set()
+    for merged_range in ws.merged_cells.ranges:
+        merged_top_left.add(merged_range.coord.split(':')[0])  # top-left coord
+
     # Build original cell value map for safety check
     orig = {}
     for row in ws.iter_rows():
         for cell in row:
-            orig[cell.coordinate] = str(cell.value).strip() if cell.value is not None else ""
+            coord = cell.coordinate
+            # MergedCell objects have no .value attribute we can set
+            from openpyxl.cell.cell import MergedCell
+            if isinstance(cell, MergedCell):
+                orig[coord] = "__MERGED__"
+            else:
+                orig[coord] = str(cell.value).strip() if cell.value is not None else ""
 
     written = 0
     for coord, value in coord_map.items():
         if not value or value == "[ТРЕБУЕТ УТОЧНЕНИЯ]":
             continue
+        cell_orig = orig.get(coord, "")
+        # Skip merged non-top-left cells
+        if cell_orig == "__MERGED__":
+            continue
         # Safety: only write to empty cells
-        if orig.get(coord, "") == "":
-            ws[coord] = value
-            written += 1
+        if cell_orig == "":
+            try:
+                ws[coord] = value
+                written += 1
+            except Exception:
+                pass  # Skip any problematic cells
 
     out = io.BytesIO()
     wb.save(out)
