@@ -8,6 +8,7 @@ from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import openpyxl
 from openpyxl.utils import get_column_letter
+from lxml import etree
 
 app = Flask(__name__)
 CORS(app, origins="*")
@@ -199,115 +200,110 @@ def fill_xlsx(file_bytes, coord_map):
 
 
 # ── DOCX HANDLER ──────────────────────────────────────────────────────────────
+W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+
+def get_cell_text(tc):
+    """Extract all text from a table cell."""
+    parts = []
+    for t in tc.iter(f'{{{W}}}t'):
+        if t.text:
+            parts.append(t.text)
+    return ''.join(parts).strip()
+
+
 def analyze_docx(file_bytes):
-    """Parse docx table rows, return structure and list of (row_idx, cell_idx, label)."""
+    """Parse docx tables using lxml. Returns structure string, candidates list, tree, all_files."""
     with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
-        xml = z.read("word/document.xml").decode("utf-8")
+        all_files = {n: z.read(n) for n in z.namelist()}
 
-    rows = re.findall(r"<w:tr[ >].*?</w:tr>", xml, re.DOTALL)
+    tree = etree.fromstring(all_files['word/document.xml'])
     structure_lines = []
-    empty_candidates = []  # (row_idx_1based, cell_idx, label)
+    # candidates: (table_idx, row_idx, label_cell_idx, answer_cell_idx, label_text)
+    candidates = []
 
-    for ri, row in enumerate(rows, 1):
-        cells = re.findall(r"<w:tc>.*?</w:tc>", row, re.DOTALL)
-        cell_texts = []
-        for cell in cells:
-            texts = re.findall(r"<w:t[^>]*>(.*?)</w:t>", cell, re.DOTALL)
-            t = "".join(texts).strip()
-            cell_texts.append(t)
+    for ti, tbl in enumerate(tree.iter(f'{{{W}}}tbl'), 1):
+        rows = tbl.findall(f'.//{{{W}}}tr')
+        for ri, row in enumerate(rows, 1):
+            cells = row.findall(f'{{{W}}}tc')
+            cell_texts = [get_cell_text(tc) for tc in cells]
 
-        if not any(cell_texts):
-            continue
+            if not any(cell_texts):
+                continue
 
-        parts = []
-        for ci, t in enumerate(cell_texts):
-            if t:
-                parts.append(f"[{ci}]='{t[:40]}'")
-            else:
-                parts.append(f"[{ci}]=ПУСТО")
-        structure_lines.append(f"Строка {ri}: {' | '.join(parts)}")
+            parts = ' | '.join(
+                f'[{ci}]={repr(t[:40])}' if t else f'[{ci}]=ПУСТО'
+                for ci, t in enumerate(cell_texts)
+            )
+            structure_lines.append(f"T{ti}Строка{ri}: {parts}")
 
-        # Find empty cells with labels
-        for ci, t in enumerate(cell_texts):
-            if t == "":
-                # Label = nearest non-empty cell to the left in same row
-                label = ""
-                for lci in range(ci - 1, -1, -1):
-                    if cell_texts[lci]:
-                        label = cell_texts[lci]
-                        break
-                if label:
-                    empty_candidates.append((ri, ci, label))
+            # Find empty answer cells: label in cell[ci-1], empty in cell[ci]
+            for ci, t in enumerate(cell_texts):
+                if t == '':
+                    label = ''
+                    for lci in range(ci - 1, -1, -1):
+                        if cell_texts[lci]:
+                            label = cell_texts[lci]
+                            break
+                    if label:
+                        candidates.append((ti, ri, ci - 1, ci, label))
 
-    return "\n".join(structure_lines), empty_candidates, rows, xml
+    return '\n'.join(structure_lines), candidates, tree, all_files
 
 
-def fill_docx(file_bytes, fills):
+def fill_docx(file_bytes, fills, tree, all_files):
     """
-    fills: list of {row: int, cell: int, value: str}
-    Write values into docx table cells by row/cell index.
+    fills: list of {table: int, row: int, cell: int, value: str}
+    Write values using lxml — correct cell targeting.
     """
-    with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
-        xml = z.read("word/document.xml").decode("utf-8")
-        names = z.namelist()
-        file_contents = {n: z.read(n) for n in names}
-
-    rows = re.findall(r"<w:tr[ >].*?</w:tr>", xml, re.DOTALL)
-
-    def make_run(text):
-        safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        return f'<w:r><w:rPr><w:lang w:val="ru-RU"/></w:rPr><w:t xml:space="preserve">{safe}</w:t></w:r>'
-
-    new_rows = list(rows)
     written = 0
 
-    for fill in fills:
-        ri = fill["row"] - 1  # 0-based
-        ci = fill["cell"]
-        value = fill["value"]
-        if not value or ri >= len(rows):
+    for fill_item in fills:
+        ti = fill_item.get('table', 1)
+        ri = fill_item['row']
+        ci = fill_item['cell']
+        value = fill_item['value']
+        if not value or value == '[ТРЕБУЕТ УТОЧНЕНИЯ]':
             continue
 
-        row = rows[ri]
-        cells = re.findall(r"<w:tc>.*?</w:tc>", row, re.DOTALL)
+        # Find the table
+        tables = list(tree.iter(f'{{{W}}}tbl'))
+        if ti - 1 >= len(tables):
+            continue
+        tbl = tables[ti - 1]
+
+        rows = tbl.findall(f'.//{{{W}}}tr')
+        if ri - 1 >= len(rows):
+            continue
+        row = rows[ri - 1]
+
+        cells = row.findall(f'{{{W}}}tc')
         if ci >= len(cells):
             continue
 
-        cell = cells[ci]
-        cell_texts = re.findall(r"<w:t[^>]*>(.*?)</w:t>", cell, re.DOTALL)
-        if "".join(cell_texts).strip() != "":
-            continue  # safety: don't overwrite
+        tc = cells[ci]
+        # Safety: only write to empty cells
+        if get_cell_text(tc):
+            continue
 
-        # Insert run into first paragraph
-        new_cell = re.sub(
-            r"(<w:p[ >](?:(?!<w:p[ >]).)*?<w:pPr>.*?</w:pPr>)(.*?)(</w:p>)",
-            lambda m: m.group(1) + make_run(value) + m.group(3),
-            cell, count=1, flags=re.DOTALL
-        )
-        if new_cell == cell:
-            new_cell = cell.replace("</w:p>", make_run(value) + "</w:p>", 1)
+        # Find or create paragraph
+        para = tc.find(f'{{{W}}}p')
+        if para is None:
+            para = etree.SubElement(tc, f'{{{W}}}p')
 
-        cells_list = list(cells)
-        cells_list[ci] = new_cell
-
-        new_row = row
-        for orig_c, new_c in zip(cells, cells_list):
-            if orig_c != new_c:
-                new_row = new_row.replace(orig_c, new_c, 1)
-
-        new_rows[ri] = new_row
+        # Create run with text
+        run = etree.SubElement(para, f'{{{W}}}r')
+        t_elem = etree.SubElement(run, f'{{{W}}}t')
+        t_elem.text = value
+        t_elem.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
         written += 1
 
-    new_xml = xml
-    for orig, new in zip(rows, new_rows):
-        if orig != new:
-            new_xml = new_xml.replace(orig, new, 1)
-
-    file_contents["word/document.xml"] = new_xml.encode("utf-8")
+    # Serialize
+    new_xml = etree.tostring(tree, xml_declaration=True, encoding='UTF-8', standalone=True)
+    all_files['word/document.xml'] = new_xml
 
     out = io.BytesIO()
-    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
-        for name, data in file_contents.items():
+    with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as zout:
+        for name, data in all_files.items():
             zout.writestr(name, data)
     out.seek(0)
     return out.read(), written
@@ -436,31 +432,37 @@ def fill_xlsx_route(file_bytes, filename):
 
 
 def fill_docx_route(file_bytes, filename):
-    structure, empty_candidates, rows, xml = analyze_docx(file_bytes)
+    structure, candidates, tree, all_files = analyze_docx(file_bytes)
 
+    # candidates: (table_idx, row_idx, label_cell_idx, answer_cell_idx, label_text)
     candidates_text = "\n".join(
-        f"  Строка {ri}, ячейка [{ci}] ← метка: \"{label[:70]}\""
-        for ri, ci, label in empty_candidates
+        f"  T{ti}Строка{ri} ячейка[{aci}] ← метка: \"{label[:70]}\""
+        for ti, ri, lci, aci, label in candidates
     )
 
     system_prompt = f"""Ты заполняешь Word-анкету (таблица) данными строительной компании.
-Верни ТОЛЬКО валидный JSON без markdown и пояснений.
-Формат: список объектов [{{"row": N, "cell": N, "value": "..."}}]
-Заполняй ТОЛЬКО ячейки из списка кандидатов. Если данных нет — пропусти.
+Верни ТОЛЬКО валидный JSON массив без markdown и пояснений.
+Формат: [{{"table": N, "row": N, "cell": N, "value": "..."}}]
+
+Правила:
+1. Заполняй ТОЛЬКО ячейки из списка кандидатов
+2. Сопоставляй метку с данными компании по смыслу
+3. Если данных нет — не включай ячейку
+4. Один массив JSON — никакого текста вокруг
 
 {COMPANY_DB}"""
 
     user_prompt = f"""СТРУКТУРА ТАБЛИЦЫ:
 {structure}
 
-ЯЧЕЙКИ ДЛЯ ЗАПОЛНЕНИЯ (ТОЛЬКО эти):
+ЯЧЕЙКИ ДЛЯ ЗАПОЛНЕНИЯ (ТОЛЬКО эти, точно по адресам):
 {candidates_text}
 
-Верни JSON массив: [{{"row": 2, "cell": 2, "value": "ООО Стройэкспертнадзор"}}, ...]"""
+Верни JSON массив: [{{"table": 1, "row": 2, "cell": 2, "value": "ООО Стройэкспертнадзор"}}, ...]"""
 
     ai_response = call_ai(system_prompt, user_prompt)
 
-    # Parse array or object
+    # Parse JSON array
     ai_text = re.sub(r"```json\s*", "", ai_response, flags=re.IGNORECASE)
     ai_text = re.sub(r"```\s*", "", ai_text)
     m = re.search(r"\[[\s\S]*\]", ai_text)
@@ -469,11 +471,14 @@ def fill_docx_route(file_bytes, filename):
     else:
         fills = json.loads(ai_text.strip())
 
-    # Validate against allowed candidates
-    allowed = {(ri, ci) for ri, ci, _ in empty_candidates}
-    fills = [f for f in fills if (f.get("row"), f.get("cell")) in allowed]
+    # Validate: only allowed cells
+    allowed = {(ti, ri, aci) for ti, ri, lci, aci, _ in candidates}
+    fills = [
+        f for f in fills
+        if (f.get("table", 1), f.get("row"), f.get("cell")) in allowed
+    ]
 
-    filled_bytes, written = fill_docx(file_bytes, fills)
+    filled_bytes, written = fill_docx(file_bytes, fills, tree, all_files)
 
     base = filename.rsplit(".", 1)[0]
     out_name = f"{base}_заполнено.docx"
