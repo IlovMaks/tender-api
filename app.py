@@ -8,7 +8,7 @@ from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import openpyxl
 from openpyxl.utils import get_column_letter
-from lxml import etree
+import xml.etree.ElementTree as ET
 
 app = Flask(__name__)
 CORS(app, origins="*")
@@ -212,19 +212,32 @@ def get_cell_text(tc):
 
 
 def analyze_docx(file_bytes):
-    """Parse docx tables using lxml. Returns structure string, candidates list, tree, all_files."""
+    """Parse docx tables using stdlib ET. Returns structure string, candidates list, tree, all_files."""
     with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
         all_files = {n: z.read(n) for n in z.namelist()}
 
-    tree = etree.fromstring(all_files['word/document.xml'])
+    # Register namespaces to avoid ns0: prefix mangling on serialization
+    namespaces = {
+        'wpc': 'http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas',
+        'w':   W,
+        'r':   'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
+        'mc':  'http://schemas.openxmlformats.org/markup-compatibility/2006',
+        'wp':  'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing',
+        'a':   'http://schemas.openxmlformats.org/drawingml/2006/main',
+        'w14': 'http://schemas.microsoft.com/office/word/2010/wordml',
+        'w15': 'http://schemas.microsoft.com/office/word/2012/wordml',
+    }
+    for prefix, uri in namespaces.items():
+        ET.register_namespace(prefix, uri)
+
+    tree = ET.fromstring(all_files['word/document.xml'])
     structure_lines = []
-    # candidates: (table_idx, row_idx, label_cell_idx, answer_cell_idx, label_text)
-    candidates = []
+    candidates = []  # (table_idx, row_idx, label_cell_idx, answer_cell_idx, label_text)
 
     for ti, tbl in enumerate(tree.iter(f'{{{W}}}tbl'), 1):
-        rows = tbl.findall(f'.//{{{W}}}tr')
+        rows = list(tbl.iter(f'{{{W}}}tr'))
         for ri, row in enumerate(rows, 1):
-            cells = row.findall(f'{{{W}}}tc')
+            cells = list(row.findall(f'{{{W}}}tc'))
             cell_texts = [get_cell_text(tc) for tc in cells]
 
             if not any(cell_texts):
@@ -236,7 +249,6 @@ def analyze_docx(file_bytes):
             )
             structure_lines.append(f"T{ti}Строка{ri}: {parts}")
 
-            # Find empty answer cells: label in cell[ci-1], empty in cell[ci]
             for ci, t in enumerate(cell_texts):
                 if t == '':
                     label = ''
@@ -251,11 +263,9 @@ def analyze_docx(file_bytes):
 
 
 def fill_docx(file_bytes, fills, tree, all_files):
-    """
-    fills: list of {table: int, row: int, cell: int, value: str}
-    Write values using lxml — correct cell targeting.
-    """
+    """Write values into docx table cells using stdlib ET."""
     written = 0
+    tables = list(tree.iter(f'{{{W}}}tbl'))
 
     for fill_item in fills:
         ti = fill_item.get('table', 1)
@@ -265,40 +275,35 @@ def fill_docx(file_bytes, fills, tree, all_files):
         if not value or value == '[ТРЕБУЕТ УТОЧНЕНИЯ]':
             continue
 
-        # Find the table
-        tables = list(tree.iter(f'{{{W}}}tbl'))
         if ti - 1 >= len(tables):
             continue
         tbl = tables[ti - 1]
 
-        rows = tbl.findall(f'.//{{{W}}}tr')
+        rows = list(tbl.iter(f'{{{W}}}tr'))
         if ri - 1 >= len(rows):
             continue
         row = rows[ri - 1]
 
-        cells = row.findall(f'{{{W}}}tc')
+        cells = list(row.findall(f'{{{W}}}tc'))
         if ci >= len(cells):
             continue
 
         tc = cells[ci]
-        # Safety: only write to empty cells
         if get_cell_text(tc):
-            continue
+            continue  # skip non-empty
 
-        # Find or create paragraph
         para = tc.find(f'{{{W}}}p')
         if para is None:
-            para = etree.SubElement(tc, f'{{{W}}}p')
+            para = ET.SubElement(tc, f'{{{W}}}p')
 
-        # Create run with text
-        run = etree.SubElement(para, f'{{{W}}}r')
-        t_elem = etree.SubElement(run, f'{{{W}}}t')
+        run = ET.SubElement(para, f'{{{W}}}r')
+        t_elem = ET.SubElement(run, f'{{{W}}}t')
         t_elem.text = value
         t_elem.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
         written += 1
 
-    # Serialize
-    new_xml = etree.tostring(tree, xml_declaration=True, encoding='UTF-8', standalone=True)
+    new_xml = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+               + ET.tostring(tree, encoding='unicode')).encode('utf-8')
     all_files['word/document.xml'] = new_xml
 
     out = io.BytesIO()
